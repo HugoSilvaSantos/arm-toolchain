@@ -1,8 +1,50 @@
 #!/usr/bin/env python3
 
 """
-A script to automatically perform the merge of incoming changes from a branch
-in upstream LLVM into a downstream branch.
+Automerge Script for LLVM Downstream Integration
+
+This script automatically merges commits from an upstream LLVM branch into a
+downstream branch, handling each commit individually as a separate merge commit.
+
+Key Features:
+- Merges commits one-by-one, preserving history and enabling easier bisection
+- Prefixes each merge commit with "Automerge:" for easy identification
+- Handles merge conflicts by creating pull requests for manual resolution
+- Respects .automerge_ignore file for paths to exclude from merging
+
+For a full list of available options, run:
+    python3 automerge.py --help
+
+Usage Examples:
+
+1. Merge all new commits from a branch:
+   python3 automerge.py \\
+     --project-name arm/arm-toolchain \\
+     --from-branch upstream/release/22.x \\
+     --to-branch release/arm-software/22.x \\
+     --repo-path /path/to/repo
+
+2. Merge from a specific commit (useful for release points):
+   python3 automerge.py \\
+     --project-name arm/arm-toolchain \\
+     --from-branch 4434dabb69916856b824f68a64b029c67175e532 \\
+     --to-branch release/arm-software/22.x \\
+     --repo-path /path/to/repo
+
+3. Dry run to preview changes without pushing:
+   python3 automerge.py \\
+     --project-name arm/arm-toolchain \\
+     --from-branch upstream/release/22.x \\
+     --to-branch release/arm-software/22.x \\
+     --repo-path /path/to/repo \\
+     --dry-run \\
+     --verbose
+
+Notes:
+- --from-branch accepts branch names, commit hashes, or tags
+- When using a commit hash as --from-branch, all commits from the merge-base
+  up to and including that commit will be merged
+- The script pushes to the 'origin' remote unless --dry-run is specified
 """
 
 import argparse
@@ -56,12 +98,30 @@ class Git:
 
 
 def is_merge_in_progress(git_repo: Git) -> bool:
+    """
+    Check if a Git merge operation is currently in progress.
+
+    Returns:
+        bool: True if a merge is in progress, False otherwise.
+    """
     # The `.git/MERGE_HEAD` file only exists when a merge operation is in progress.
     merge_head_path = Path(git_repo.repo_path) / ".git" / "MERGE_HEAD"
     return merge_head_path.exists()
 
 
 def restore_changes_to_ignored_files(git_repo: Git, ignore_list: list[str]) -> None:
+    """
+    Restore files in the ignore list to their state in the target branch.
+
+    This function handles files specified in .automerge_ignore by:
+    1. Keeping the target branch version for conflicting files
+    2. Ensuring deleted files remain deleted
+    3. Restoring all other ignored files to their original state
+
+    Args:
+        git_repo: Git repository helper instance.
+        ignore_list: List of file paths to ignore during merge.
+    """
     if not ignore_list:
         return
     # First, deal with any conflicting changes to files in the ignore list,
@@ -80,12 +140,24 @@ def restore_changes_to_ignored_files(git_repo: Git, ignore_list: list[str]) -> N
 
 
 def has_unresolved_conflicts(git_repo: Git) -> bool:
+    """
+    Check if there are any unresolved merge conflicts.
+
+    Returns:
+        bool: True if unresolved conflicts exist, False otherwise.
+    """
     diff_output = git_repo.run_cmd(["diff", "--name-only", "--diff-filter=U"])
     diff_output = diff_output.strip()
     return bool(diff_output)
 
 
 def prefix_current_commit_message(git_repo: Git) -> None:
+    """
+    Prefix the current commit message with "Automerge: " for easy identification.
+
+    Args:
+        git_repo: Git repository helper instance.
+    """
     log_output = git_repo.run_cmd(
         ["log", "HEAD", "--max-count=1", "--pretty=format:%B"]
     )
@@ -101,6 +173,25 @@ def merge_commit(
     dry_run: bool,
     verbose: bool,
 ) -> None:
+    """
+    Merge a single commit into the target branch.
+
+    Performs a no-fast-forward merge of the specified commit, handles files in
+    the ignore list, and pushes the result to the remote repository (unless
+    running in dry-run mode).
+
+    Args:
+        git_repo: Git repository helper instance.
+        to_branch: Name of the target branch to merge into.
+        commit_hash: Hash of the commit to merge.
+        ignored_paths: List of file paths to ignore during merge.
+        dry_run: If True, skip pushing to remote repository.
+        verbose: If True, log additional debug information.
+
+    Raises:
+        MergeConflictError: If the merge results in unresolved conflicts.
+        RuntimeError: If git merge fails unexpectedly.
+    """
     logger.info("Merging commit %s into %s", commit_hash, to_branch)
     git_repo.run_cmd(["switch", to_branch])
     if verbose:
@@ -135,6 +226,13 @@ def merge_commit(
 
 
 def create_pull_request(git_repo: Git, to_branch: str) -> None:
+    """
+    Create a pull request for a merge conflict using GitHub CLI.
+
+    Args:
+        git_repo: Git repository helper instance.
+        to_branch: Base branch for the pull request.
+    """
     logger.info("Creating Pull Request")
     log_output = git_repo.run_cmd(
         ["log", "HEAD", "--max-count=1", "--pretty=format:%s"]
@@ -163,6 +261,18 @@ def create_pull_request(git_repo: Git, to_branch: str) -> None:
 def process_conflict(
     git_repo: Git, commit_hash: str, to_branch: str, dry_run: bool
 ) -> None:
+    """
+    Handle a merge conflict by creating a branch and pull request for manual resolution.
+
+    Creates a new branch from the conflicting commit and, unless in dry-run mode,
+    pushes it to the remote and creates a PR labeled for automerge conflicts.
+
+    Args:
+        git_repo: Git repository helper instance.
+        commit_hash: Hash of the commit that caused the conflict.
+        to_branch: Base branch for the pull request.
+        dry_run: If True, skip pushing and creating the PR.
+    """
     logger.info("Processing conflict for %s", commit_hash)
     git_repo.run_cmd(["switch", "--force-create", AUTOMERGE_BRANCH, commit_hash])
     if dry_run:
@@ -174,6 +284,32 @@ def process_conflict(
 
 
 def get_merge_commit_list(git_repo: Git, from_branch: str, to_branch: str) -> list[str]:
+    """
+    Calculate the list of commits to be merged from source to target branch.
+
+    This function:
+    1. Finds the merge-base (common ancestor) between source and target branches
+    2. Gets all commits from merge-base to from_branch
+    3. Returns them in chronological order (oldest first)
+
+    Args:
+        git_repo: Git repository helper instance.
+        from_branch: Source branch, tag, or commit hash to merge from. Can be:
+                    - A branch name (e.g., "upstream/release/22.x")
+                    - A commit hash (e.g., "4434dabb6991...")
+                    - A tag name (e.g., "llvmorg-22.1.0")
+        to_branch: Target branch to merge into.
+
+    Returns:
+        List of commit hashes in chronological order (oldest first).
+
+    Examples:
+        # Merge all commits from a branch
+        commits = get_merge_commit_list(repo, "upstream/main", "my-branch")
+
+        # Merge from a specific commit (all commits from merge-base to that commit)
+        commits = get_merge_commit_list(repo, "4434dabb6991", "my-branch")
+    """
     logger.info(
         "Calculating list of commits to be merged from %s to %s", from_branch, to_branch
     )
@@ -193,6 +329,16 @@ def get_merge_commit_list(git_repo: Git, from_branch: str, to_branch: str) -> li
 
 
 def pr_exist_for_label(project_name: str, label: str) -> bool:
+    """
+    Check if any open pull requests exist with the specified label.
+
+    Args:
+        project_name: GitHub repository in OWNER/REPO format.
+        label: Label to search for.
+
+    Returns:
+        bool: True if at least one open PR with the label exists.
+    """
     logger.info("Fetching list of open PRs for label '%s'.", label)
     gh_process = subprocess.run(
         ["gh", "pr", "list", "--label", label, "--repo", project_name, "--json", "id"],
@@ -204,6 +350,12 @@ def pr_exist_for_label(project_name: str, label: str) -> bool:
 
 
 def is_worktree_clean(git_repo: Git) -> bool:
+    """
+    Check if the Git worktree is clean (no uncommitted changes).
+
+    Returns:
+        bool: True if worktree is clean, False if there are uncommitted changes.
+    """
     # `git status --porcelain` returns an empty result if worktree is clean
     status_output = git_repo.run_cmd(["status", "--porcelain"]).strip()
     return len(status_output) == 0
@@ -223,8 +375,8 @@ def main():
     arg_parser.add_argument(
         "--from-branch",
         required=True,
-        metavar="BRANCH_NAME",
-        help="The branch where the incoming commits are found.",
+        metavar="BRANCH_OR_COMMIT",
+        help="Source branch, commit hash, or tag to merge from. When a commit hash is provided, all commits from the merge-base up to and including that commit will be merged.",
     )
     arg_parser.add_argument(
         "--to-branch",
